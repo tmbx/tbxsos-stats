@@ -1,0 +1,20 @@
+#!/bin/sh
+
+if [ "$1" = "remove" ]; then
+    if [ -e /usr/bin/kstats ]; then
+	rm -rf /usr/bin/kstats
+    fi
+fi
+
+#if [ "$1" = "purge" ]; then
+#	if [ -e /var/tbxsosd-stats/rrd/pkg.rrd ]; then
+#		rm -rf /var/tbxsosd-stats/rrd/pkg.rrd
+#	fi
+#	if [ -e /var/tbxsosd-stats/rrd/pkg-delay.rrd ]
+#		rm -rf /var/tbxsosd-stats/rrd/pkg-delay.rrd
+#	fi
+#	# do not delete data in /var/tbxsosd-stats/www
+#fi
+
+
+

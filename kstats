@@ -1,0 +1,506 @@
+#!/usr/bin/env python
+# -*- mode: python; py-indent-offset: 4; -*-
+
+#####
+##### tbxsosd stats
+#####
+
+# extract data from event_db database
+# create rrd graphs and html tables containing last week and previous week stats
+
+# needed:
+# must run "$0 init" to initialize rrd databases and create needed directories
+# must run "$0 update_rrd_database" every minute
+
+
+# CONFIGS
+RRDPATH="/var/cache/tbxsos-stats/rrd"
+WWWPATH="/var/cache/tbxsos-stats/www"
+RRD_UPDATE_INTERVAL_SECONDS=60 # don't put to less 60 seconds... it would be useless
+RRD_GROUP_SECONDS=3600
+
+# STD imports
+import os, sys, time, random
+
+# kctl
+from kctllib.kdatabase import *
+from kctllib.kparams import *
+from kctllib.kexcept import *
+
+# kpython
+from kfile import *
+from krun import *
+
+sec_in_min = 60
+sec_in_hour = 3600
+sec_in_day = 86400
+sec_in_week = sec_in_day * 7
+
+#
+# no python rrdtool module in gutsy right now... call the binary utility for now
+def rrdtool_exec(arg1, *args):
+    cmd = ["rrdtool"] + [arg1] + list(args)
+    proc = KPopen("", cmd) # "" is data sent to stdin
+    if proc.return_code != 0:
+        err_raw(proc.stderr)
+        sys.exit(1)
+
+
+def rrdtool_create(*args):
+    rrdtool_exec("create", *args)
+
+
+def rrdtool_graph(*args):
+    rrdtool_exec("graph", *args)
+
+
+def rrdtool_update(*args):
+    rrdtool_exec("update", *args)
+
+
+# convert hh:mm:ss to seconds
+def time_to_seconds(totaldelay):
+    if totaldelay == None:
+        return float(0)
+    arr = totaldelay.split(":")
+    return float(3600 * int(arr[0]) + 60 * int(arr[1]) + float(arr[2]))
+
+
+# well... :)
+def zero_devide(x, y):
+    if y == 0:
+        return 0
+    return x / y
+
+
+# get a dict of dicts of ... with calculated data for building html table
+def get_stats_interval(start, pkg_types, pkg_type_names, interval_delay, interval_names):
+    s = {}
+    s["pkg"] = {}
+    s["pkgdelay"] = {}
+    s["avgpkgdelay"] = {}
+
+    s["proc"] = {}
+    s["procdelay"] = {}
+    s["avgprocdelay"] = {}
+
+    # get data (total nb, total delay, avg delay)
+    s["pkg"]["all"] = {}
+    s["proc"]["all"] = {}
+    for pkg_type in pkg_types:
+        s["pkg"][pkg_type] = {}
+        s["pkgdelay"][pkg_type] = {}
+        s["avgpkgdelay"][pkg_type] = {}
+
+        s["proc"][pkg_type] = {}
+        s["procdelay"][pkg_type] = {}
+        s["avgprocdelay"][pkg_type] = {}
+
+        newstart = start
+        for interval_name in interval_names:
+            newstop = newstart + interval_delay - 1
+
+            [nb, delayhms] = sdb_getstatspackagings(newstart, newstop, pkg_type)
+            delay = time_to_seconds(delayhms)
+            avgdelay = zero_devide(delay, nb)
+            s["pkg"][pkg_type][interval_name] = nb
+            s["pkgdelay"][pkg_type][interval_name] = delay
+            s["avgpkgdelay"][pkg_type][interval_name] = avgdelay
+
+            [nb, delayhms] = sdb_getstatsprocessings(newstart, newstop, pkg_type)
+            delay = time_to_seconds(delayhms)
+            avgdelay = zero_devide(delay, nb)
+            s["proc"][pkg_type][interval_name] = nb
+            s["procdelay"][pkg_type][interval_name] = delay
+            s["avgprocdelay"][pkg_type][interval_name] = avgdelay
+
+            newstart = newstart + 86400
+
+    # calculate total nbs and averages per interval
+    s["pkg"]["all"] = {}
+    s["pkgdelay"]["all"] = {}
+    s["avgpkgdelay"]["all"] = {}
+    s["proc"]["all"] = {}
+    s["procdelay"]["all"] = {}
+    s["avgprocdelay"]["all"] = {}
+
+    for pkg_type in pkg_types:
+        for interval_name in interval_names:
+            try:
+                s["pkg"]["all"][interval_name] += s["pkg"][pkg_type][interval_name]
+                s["pkgdelay"]["all"][interval_name] += s["pkgdelay"][pkg_type][interval_name]
+                s["proc"]["all"][interval_name] += s["proc"][pkg_type][interval_name]
+                s["procdelay"]["all"][interval_name] += s["procdelay"][pkg_type][interval_name]
+            except:
+                s["pkg"]["all"][interval_name] = s["pkg"][pkg_type][interval_name]
+                s["pkgdelay"]["all"][interval_name] = s["pkgdelay"][pkg_type][interval_name]
+                s["proc"]["all"][interval_name] = s["proc"][pkg_type][interval_name]
+                s["procdelay"]["all"][interval_name] = s["procdelay"][pkg_type][interval_name]
+
+            # calculate averages
+            s["avgpkgdelay"]["all"][interval_name] = zero_devide(s["pkgdelay"]["all"][interval_name], s["pkg"]["all"][interval_name])
+            s["avgprocdelay"]["all"][interval_name] = zero_devide(s["procdelay"]["all"][interval_name], s["proc"]["all"][interval_name])
+
+    # recalculate averages based on previous calculated data
+    for interval_name in interval_names:
+        s["avgpkgdelay"]["all"][interval_name] = zero_devide(s["pkgdelay"]["all"][interval_name], s["pkg"]["all"][interval_name])
+        s["avgprocdelay"]["all"][interval_name] = zero_devide(s["procdelay"]["all"][interval_name], s["proc"]["all"][interval_name])
+
+    # calculate total nbs and averages for the entire interval
+    bigtotalpkg = 0
+    bigtotalpkgdelay = 0
+    bigtotalproc = 0
+    bigtotalprocdelay = 0
+    for pkg_type in pkg_types:
+        totalpkg = 0
+        totalpkgdelay = 0
+        totalproc = 0
+        totalprocdelay = 0
+        for interval_name in interval_names:
+            totalpkg += s["pkg"][pkg_type][interval_name]
+            totalpkgdelay += s["pkgdelay"][pkg_type][interval_name]
+            totalproc += s["proc"][pkg_type][interval_name]
+            totalprocdelay += s["procdelay"][pkg_type][interval_name]
+
+        bigtotalpkg += totalpkg
+        bigtotalpkgdelay += totalpkgdelay
+        bigtotalproc += totalproc
+        bigtotalprocdelay += totalprocdelay
+
+        s["pkg"][pkg_type]["all"] = totalpkg
+        s["pkgdelay"][pkg_type]["all"] = totalpkgdelay
+        s["avgpkgdelay"][pkg_type]["all"] = zero_devide(totalpkgdelay, totalpkg)
+        s["proc"][pkg_type]["all"] = totalproc
+        s["procdelay"][pkg_type]["all"] = totalprocdelay
+        s["avgprocdelay"][pkg_type]["all"] = zero_devide(totalprocdelay, totalproc)
+
+    s["pkg"]["all"]["all"] = bigtotalpkg
+    s["pkgdelay"]["all"]["all"] = bigtotalpkgdelay
+    s["avgpkgdelay"]["all"]["all"] = zero_devide(bigtotalpkgdelay, bigtotalpkg)
+    s["proc"]["all"]["all"] = bigtotalproc
+    s["procdelay"]["all"]["all"] = bigtotalprocdelay
+    s["avgprocdelay"]["all"]["all"] = zero_devide(bigtotalprocdelay, bigtotalproc)
+
+    return s
+
+
+# return (as a string) web page containing stats and linking to a graph
+def html_table_stats_week(start):
+    pkg_types = [0, 1, 2, 3]
+    pkg_type_names = ["Signature", "Encryption", "PoD", "Enc. and PoD"]
+    interval_names = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
+    interval_delay = 86400
+    # get stats in a dict of dict of ...
+    s = get_stats_interval(start, pkg_types, pkg_type_names, interval_delay, interval_names)
+    html = html_table_stats_week2("packagings details", pkg_types, pkg_type_names, interval_names, s["pkg"], s["avgpkgdelay"])
+    html += html_table_stats_week2("processings details", pkg_types, pkg_type_names, interval_names, s["proc"], s["avgprocdelay"])
+    return html
+
+# yeah...
+def html_table_stats_week2(type, pkg_types, pkg_type_names, interval_names, nb, avgdelay):
+    html = """<table class="stats" border="1"><thead><tr><td class="bigtitle" colspan="17">%s</td>
+</tr><tr class="interval_names"><td class="leftcol">&nbsp;</td>""" % ( type )
+    ##### INTERVAL NAMES #####
+    for interval_name in interval_names:
+        html += """<td colspan="2" class="coltitle1">%s</td>""" % ( interval_name )
+    html += """<td colspan="2" class="coltitle1 coltitleall">All</td>"""
+    html += """</tr><tr class="stats_what"><td class="leftcol">&nbsp;</td>"""
+
+    ##### SUBTITLES #####
+    for i in range(0, len(interval_names)):
+        html += """<td class="coltitle2 coltitlenb">nb</td><td class="coltitle2 coltitledelay">avg. delay</td>"""
+    html += """<td class="coltitle2 coltitlenball">nb</td><td class="coltitle2 coltitledelayall">avg. delay</td>"""
+    html += "</tr>"
+
+    ##### PACKAGING STATS #####
+    for pkg_type in pkg_types:
+        html += """<tr><td class="leftcol">%s</td>""" % ( pkg_type_names[pkg_type] )
+        for interval_name in interval_names:
+            html += """	<td class="cell nb">%s</td><td class="cell delay">%0.2f</td>""" % ( str(nb[pkg_type][interval_name]), avgdelay[pkg_type][interval_name] )
+        html += """   <td class="cell nb week">%s</td><td class="cell delay week">%0.2f</td>""" % ( str(nb[pkg_type]["all"]), avgdelay[pkg_type]["all"] )
+        html += "</tr>"
+
+  ##### 'SUBTOTAL' STATS #####
+    html += """<tr><td class="leftcolall all">all types</td>"""
+    for interval_name in interval_names:
+        html += """	<td class="cell nb all">%s</td><td class="cell delay all">%0.2f</td>""" % ( str(nb["all"][interval_name]), avgdelay["all"][interval_name] )
+    html += """   <td class="cell nb all week">%s</td><td class="cell delay all week">%0.2f</td>""" % ( str(nb["all"]["all"]), avgdelay["all"]["all"] )
+    html += "</tr>"
+
+    html += "</table>"
+    return html
+
+
+# get stats from event_db database and updates rrd database
+# to run every RRD_UPDATE_INTERVAL_SECONDS
+def update_rrd_database(start=None):
+    # get last period delimited by RRD_UPDATE_INTERVAL_SECONDS
+    if start == None:
+        t = int(time.time())
+        t = t - t % RRD_UPDATE_INTERVAL_SECONDS # ...
+        start = t - RRD_UPDATE_INTERVAL_SECONDS
+    stop = start + RRD_UPDATE_INTERVAL_SECONDS - 1
+
+    # get raw data, do some calculations
+    [pkgnb, pkgdelayhms] = sdb_getstatspackagings(start, stop)
+    pkgnbpergroup = float(pkgnb) / (float(RRD_UPDATE_INTERVAL_SECONDS) / float(RRD_GROUP_SECONDS))
+    pkgdelay = time_to_seconds(pkgdelayhms)
+    pkgavgdelay = zero_devide(pkgdelay, pkgnb)
+
+    [procnb, procdelayhms] = sdb_getstatsprocessings(start, stop)
+    procnbpergroup = float(procnb) / (float(RRD_UPDATE_INTERVAL_SECONDS) / float(RRD_GROUP_SECONDS))
+    procdelay = time_to_seconds(procdelayhms)
+    procavgdelay = zero_devide(procdelay, procnb)
+
+    # update rrd databases
+    rrd_update_pkg_proc(pkgnbpergroup, procnbpergroup, stop)
+    rrd_update_pkg_proc_delay(pkgavgdelay, procavgdelay, stop)
+
+
+# update stats and graphs
+# to run every now and then (15 minute?)
+def generate_stats():
+    gt = time.gmtime(time.time()) # UTC
+
+    ## CURRENT WEEK
+    # get current week startstamp
+    midnightstamp = int(time.mktime([gt[0], gt[1], gt[2], 0, 0, 0, -1, -1, 0]))
+    weekday = gt[6]
+    start = midnightstamp - ((weekday + 1) * 86400)
+    stop = start + 7 * 86400
+    debug("CURRENT WEEK: from '%s' to '%s'" % (time.ctime(start), time.ctime(stop)) )
+
+    # create html page and graphs
+    html_table = html_table_stats_week(start)
+    datestart = time.strftime("%Y-%m-%d", time.gmtime(start))
+    file = os.path.join(WWWPATH, "stats-weekly-%s.html" % ( datestart ))
+    write_file(file, html_table)
+    print "Graphing current week, starting on %s" % (time.ctime(start))
+    rrd_graph(start, stop, "stats-weekly-")
+
+    ## LAST WEEK
+    # get last week startstamp
+    midnightstamp = int(time.mktime([gt[0], gt[1], gt[2], 0, 0, 0, -1, -1, 0]))
+    weekday = gt[6]
+    start = midnightstamp - ((weekday + 1) * 86400) - (7 * 86400)
+    stop = start + 7 * 86400
+    debug("LAST WEEK: from '%s' to '%s'" % (time.ctime(start), time.ctime(stop)) )
+
+    # create html page and graphs
+    html_table = html_table_stats_week(start)
+    datestart = time.strftime("%Y-%m-%d", time.gmtime(start))
+    file = os.path.join(WWWPATH, "stats-weekly-%s.html" % ( datestart ))
+    write_file(file, html_table)
+    print "Graphing last week, starting on %s" % (time.ctime(start))
+    rrd_graph(start, stop, "stats-weekly-")
+
+
+def rrd_init(file_prefix="", startstamp=None):
+    # settings
+    pkgminvalue = 0
+    pkgmaxvalue = 1000000
+    delayminvalue = 0
+    delaymaxvalue = 1000
+    keepseconds1 = 3 * sec_in_week # we want data available for 3 weeks
+    groupseconds1 = RRD_UPDATE_INTERVAL_SECONDS # we want data grouped by 1 min
+
+    # calculate data for creating database
+    groupcount1 = groupseconds1 / RRD_UPDATE_INTERVAL_SECONDS
+    keepcount1 = keepseconds1 / groupseconds1
+
+    # create packages / processing database
+    if startstamp == None:
+        startstamp = int(time.time()) - sec_in_day
+
+    # create packages / processing database
+    # stores total count for sample (RRD_UPDATE_INTERVAL_SECONDS seconds)
+    rrdfile = os.path.join(RRDPATH, file_prefix + "pkg.rrd")
+    rrdtool_create(rrdfile,
+                   '--start', str(startstamp-86400),
+                   '--step', str(RRD_UPDATE_INTERVAL_SECONDS),
+                   "DS:pkg:GAUGE:%i:%i:%i" % (RRD_UPDATE_INTERVAL_SECONDS, pkgminvalue, pkgmaxvalue),
+                   "RRA:AVERAGE:0.5:%i:%i" % (groupcount1, keepcount1),
+                   "DS:process:GAUGE:%i:%i:%i" % (RRD_UPDATE_INTERVAL_SECONDS, pkgminvalue, pkgmaxvalue),
+                   "RRA:AVERAGE:0.5:%i:%i" % (groupcount1, keepcount1),
+                   )
+
+    # creates packages delay / processing delay database
+    # stores total delay for sample (RRD_UPDATE_INTERVAL_SECONDS seconds)
+    rrdfile = os.path.join(RRDPATH, file_prefix + "pkg-delay.rrd")
+    rrdtool_create(rrdfile,
+                   '--start', str(startstamp-86400),
+                   '--step', str(RRD_UPDATE_INTERVAL_SECONDS),
+                   "DS:pkg-delay:GAUGE:%i:%i:%i" % (RRD_UPDATE_INTERVAL_SECONDS, delayminvalue, delaymaxvalue),
+                   "RRA:AVERAGE:0.5:%i:%i" % (groupcount1, keepcount1),
+                   "DS:process-delay:GAUGE:%i:%i:%i" % (RRD_UPDATE_INTERVAL_SECONDS, delayminvalue, delaymaxvalue),
+                   "RRA:AVERAGE:0.5:%i:%i" % (groupcount1, keepcount1),
+                   )
+
+
+def rrd_update_pkg_proc(val1, val2, stamp=None, file_prefix=""):
+    rrdfile = os.path.join(RRDPATH, file_prefix + "pkg.rrd")
+    if stamp == None:
+        stamp = 'N'
+    else:
+        stamp = str(stamp)
+    rrdtool_update(rrdfile, "%s:%i:%i" % (stamp, val1, val2))
+
+
+def rrd_update_pkg_proc_delay(val1, val2, stamp=None, file_prefix=""):
+    rrdfile = os.path.join(RRDPATH, file_prefix + "pkg-delay.rrd")
+    if stamp == None:
+        stamp = 'N'
+    else:
+        stamp = str(stamp)
+    rrdtool_update(rrdfile, "%s:%i:%i" % (stamp, val1, val2))
+
+
+def rrd_graph_pkg(imagefile, desc, rrdfile, startstamp, stopstamp):
+    rrdtool_graph(imagefile,
+                  '--start', str(startstamp),
+                  '--end', str(stopstamp),
+                  '--title', str(desc),
+                  '--x-grid', 'HOUR:6:DAY:1:DAY:1:0:%a',
+                  #'--step', str(step),
+                  'DEF:pkg=%s:pkg:AVERAGE' % (rrdfile),
+                  'DEF:process=%s:process:AVERAGE' % (rrdfile),
+                  'LINE1:pkg#ff0000:Packagings / hour                         ',
+                  'LINE2:process#00ff00:Processings / hour                    ')
+
+
+def rrd_graph_pkg_delay(imagefile, desc, rrdfile, startstamp, stopstamp):
+    rrdtool_graph(imagefile,
+                  '--start', str(startstamp),
+                  '--end', str(stopstamp),
+                  '--title', str(desc),
+                  '--x-grid', 'HOUR:6:DAY:1:DAY:1:0:%a',
+                  '--vertical-label', 'seconds',
+                  '--upper-limit', str(1),
+                  #'--step', str(step),
+                  'DEF:pkg-delay=%s:pkg-delay:AVERAGE' % (rrdfile),
+                  'DEF:process-delay=%s:process-delay:AVERAGE' % (rrdfile),
+                  'LINE1:pkg-delay#ff0000:Time for packagings (seconds)            ',
+                  'LINE2:process-delay#00ff00:Time for processings (seconds)       ')
+
+
+def rrd_graph(startstamp, stopstamp, file_prefix=""):
+    datestr = time.strftime("%Y-%m-%d", time.gmtime(startstamp))
+    desc = "Week starting on %s" % ( datestr )
+    rrdfile = os.path.join(RRDPATH, "pkg.rrd")
+    imagefile = os.path.join(WWWPATH, file_prefix + "pkg-%s.png" % (datestr))
+    rrd_graph_pkg(imagefile, desc, rrdfile, startstamp, stopstamp)
+    rrdfile = os.path.join(RRDPATH, "pkg-delay.rrd")
+    imagefile = os.path.join(WWWPATH, file_prefix + "pkg-delay-%s.png" % (datestr))
+    rrd_graph_pkg_delay(imagefile, desc, rrdfile, startstamp, stopstamp)
+
+
+def test_index(file_prefix=""):
+    html = """<html><head></head><body>___images___</body></html>"""
+    images = ""
+    for file in ["stats-pkg-curweek", "stats-pkg-lastweek", "stats-pkg-delay-curweek", "stats-pkg-delay-lastweek" ]:
+        file = os.path.join(WWWPATH, file_prefix + file + ".png")
+        images = images + '<div>%s <img src="%s" /></div>\n' % (file, file)
+    html = html.replace("___images___", images)
+    indexfile = os.path.join(WWWPATH, file_prefix + "index.html")
+    f = open(indexfile, "w")
+    f.write(html)
+    f.close()
+
+
+def get_day_of_week():
+    # don't remember why I chose a method this complex... always in UTC
+    # get time struct
+    tt = datetime.datetime.utcnow().utctimetuple()
+    # get (safe) day of week
+    weekday = int(datetime.datetime(tt[0], tt[1], tt[2], 12).strftime("%w"))
+
+
+def get_timestamp_week_beginning():
+    w = get_day_of_week()
+
+
+def test():
+    import random
+
+    prefix = "dev-"
+    prefix = ""
+
+    global RRD_UPDATE_INTERVAL_SECONDS
+    RRD_UPDATE_INTERVAL_SECONDS = 3600
+
+    curstamp = int(time.time()) # UTC
+    gt = time.localtime(curstamp) # LOCAL
+    midnightstamp = int(time.mktime([gt[0], gt[1], gt[2], 0, 0, 0, -1, -1, 0]))
+    weekday = gt[6]
+    startstamp = midnightstamp - ((weekday + 1) * 86400) - (86400 * 7)
+
+    # create dev database
+    rrd_init(prefix, startstamp - 1) # allow updating with previous timestamps for testing
+
+    # fill rrd database with random data starting at startstamp, with an interval of 60 seconds
+    diff = 0
+    i = 0
+    for stamp in range(int(startstamp), int(curstamp), RRD_UPDATE_INTERVAL_SECONDS):
+        if i >= 168:
+            # reset for new week
+            i = 0
+        i += 1
+        start = stamp
+        stop = stamp + RRD_UPDATE_INTERVAL_SECONDS - 1
+        print time.ctime(start)
+        #if i <= 24:
+        #	#print "Faking first day of the week data to easily see if data is properly aligned in the graphs"
+        #	pkgnbpergroup = 5
+        #	procnbpergroup = 10
+        #	pkgavgdelay = 1
+        #	procavgdelay = 1.5
+        #else:
+        if True:
+            # get raw data, do some calculations
+            [pkgnb, pkgdelayhms] = sdb_getstatspackagings(start, stop)
+            pkgnbpergroup = pkgnb / (RRD_UPDATE_INTERVAL_SECONDS / RRD_GROUP_SECONDS)
+            pkgdelay = time_to_seconds(pkgdelayhms)
+            pkgavgdelay = zero_devide(pkgdelay, pkgnb)
+            [procnb, procdelayhms] = sdb_getstatsprocessings(start, stop)
+            procnbpergroup = procnb / (RRD_UPDATE_INTERVAL_SECONDS / RRD_GROUP_SECONDS)
+            procdelay = time_to_seconds(procdelayhms)
+            procavgdelay = zero_devide(procdelay, procnb)
+        # update data
+        rrd_update_pkg_proc(pkgnbpergroup, procnbpergroup, stop, prefix) # UTC
+        rrd_update_pkg_proc_delay(pkgavgdelay, procavgdelay, stop, prefix) # UTC
+    # graph
+    #rrd_graph(curstamp, prefix) # UTC
+    # index
+    #test_index(prefix)
+
+
+def main():
+    kparams_init()
+    if kparams_get("debug"):
+        do_debug()
+
+    if len(sys.argv) == 2 and sys.argv[1] == "init":
+        if not os.path.exists(WWWPATH):
+            os.makedirs(WWWPATH)
+        if not os.path.exists(RRDPATH):
+            os.makedirs(RRDPATH)
+        rrd_init()
+    elif len(sys.argv) == 2 and sys.argv[1] == "update_rrd_database":
+        db_init()
+        update_rrd_database()
+    elif len(sys.argv) == 2 and sys.argv[1] == "generate_stats":
+        db_init()
+        generate_stats()
+    elif  len(sys.argv) == 2 and sys.argv[1] == "test":
+        test()
+    else:
+        print "Usage:"
+        print "       %s init" % ( sys.argv[0] )
+        print "       %s update_rrd_database" % ( sys.argv[0] )
+        print "       %s generate_stats" % ( sys.argv[0] )
+        #print "       %s test" % ( sys.argv[0] )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

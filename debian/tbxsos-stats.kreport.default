@@ -1,0 +1,7 @@
+KREPORT_ENABLED=0
+KREPORT_MAILTO=""
+
+# Leave those blank if you want them automatically generated.
+KREPORT_HOSTNAME=""
+KREPORT_SUBJECT=""
+KREPORT_FROM=""

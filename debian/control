@@ -1,0 +1,15 @@
+Source: tbxsos-stats
+Section: teambox
+Priority: optional
+Maintainer: Teambox Packages
+Build-Depends: debhelper (>= 5), make, python-support
+Standards-Version: 3.7.2
+
+Package: tbxsos-stats
+Architecture: all
+Conflicts: tbxsosd-stats
+Replaces: tbxsosd-stats
+Provides: tbxsosd-stats
+Depends: ${shlibs:Depends}, ${misc:Depends}, ${python:Depends}, python, kctllib (>= 1.3.99) | kctllib-nodb (>= 1.3.99), rrdtool, kpython (>= 1.1), mail-transport-agent
+Description: Teambox Sign-On Server statistic gatherer
+  Gathers statistics about the requests done on the TBXSOS.

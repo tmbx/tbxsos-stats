@@ -1,0 +1,3 @@
+kstats usr/bin
+kreport usr/bin
+debian/tbxsos-stats.site.conf etc/teambox/tbxsos-config/

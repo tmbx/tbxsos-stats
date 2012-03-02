@@ -1,0 +1,4 @@
+var/cache/tbxsos-stats/rrd
+var/cache/tbxsos-stats/www
+etc/teambox/tbxsos-config
+usr/bin

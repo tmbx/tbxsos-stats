@@ -1,0 +1,121 @@
+#!/bin/bash
+
+source /etc/default/kreport
+
+if [ -z "$KREPORT_ENABLED" -o "$KREPORT_ENABLED" != "1" ]; then
+    exit 0;
+fi
+if [ -z "KREPORT_MAILTO" ]; then
+    exit 0
+fi
+
+if [ -z "$KREPORT_HOSTNAME" ]; then
+    KREPORT_HOSTNAME=$(hostname --fqdn)
+fi
+if [ -z "$KREPORT_SUBJECT" ]; then
+    KREPORT_SUBJECT="Daily report for $KREPORT_HOSTNAME"
+fi
+if [ -z "$KREPORT_FROM" ]; then
+    KREPORT_FROM="$KREPORT_HOSTNAME <kreport@$KREPORT_HOSTNAME>"
+fi
+
+PSQL="sudo -u postgres psql -q -t -d tbxsosd_db -f -"
+OUT=$(mktemp)
+
+exec 4>&1
+exec >$OUT
+
+# Generate the mail fields.
+for i in $KREPORT_MAILTO; do
+    echo "To: $i"
+done
+
+echo "From: $KREPORT_FROM"
+echo "Date: $(date -R)"
+echo "Subject: $KREPORT_SUBJECT"
+echo
+
+# Generate the body.
+
+echo "Usage statistics from $KREPORT_HOSTNAME, in the last 24 hours."
+echo
+
+echo "The following data exclude connections Teambox hosts."
+
+echo "Logins by username:"
+$PSQL <<EOF
+select var_val, count(var_val) from today_events
+  where event_name = 'login'
+    and
+  session_id in
+  (select session_id from today_events
+    where event_name = 'connect' and var_key = 'ip' and
+    (var_val != '69.70.52.246' and
+     var_val != '209.20.77.20' and
+     var_val != '10.0.0.1'))
+ group by var_val
+ order by var_val;
+EOF
+
+echo "Number of connections:"
+$PSQL <<EOF
+select count(var_val)
+  from today_events
+  where event_name = 'connect' and var_key = 'ip'
+    and (var_val != '69.70.52.246' and
+         var_val != '209.20.77.20' and
+         var_val != '10.0.0.1');                                                               
+EOF
+
+echo "Number of distinct IP:"
+$PSQL <<EOF
+select count(v.var_val) from
+  (select distinct var_val from today_events
+    where event_name = 'connect' and var_key = 'ip' and
+    (var_val != '69.70.52.246' and
+     var_val != '209.20.77.20' and
+     var_val != '10.0.0.1')) as v;
+EOF
+
+echo "List of distinct IPs by number of connections:"
+IPS=$($PSQL <<EOF
+select var_val as ip, count(var_val) as count
+  from today_events
+  where event_name = 'connect' and var_key = 'ip'
+    and (var_val != '69.70.52.246' and var_val != '209.20.77.20' and var_val != '10.0.0.1')
+ group by ip order by count desc;
+EOF
+)
+IFS=$'\n'
+for IP in $IPS; do
+    name=$(echo $IP | awk '{print $1}' | xargs host 2> /dev/null | head -1 | awk '{print $2}')
+    echo -n $IP
+    if [ ! -z "$name" ]; then
+        echo $'\t'"($name)"
+    else
+        echo
+    fi
+done
+echo
+IFS=" "$'\t'$'\n'
+
+echo "Breakup of event types by name:"
+$PSQL <<EOF
+select event_name, count(event_name) from events
+   where (now() - event_time::timestamp with time zone) < '1 day'::interval and
+    session_id not in
+    (select session_id
+        from today_events
+        where event_name = 'connect' and
+              var_key = 'ip' and
+              (var_val = '69.70.52.246' or var_val = '209.20.77.20' or var_val = '10.0.0.1'))
+  group by event_name
+  order by count desc;
+EOF
+
+exec 1>&4 4>&-
+
+sendmail $KREPORT_MAILTO < $OUT
+rm $OUT
+
+exit 0
